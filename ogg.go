@@ -20,18 +20,34 @@ type oggReader struct {
 }
 
 func (r *oggReader) NextPacket() ([]byte, error) {
-	if !r.ready {
-		err := r.currentPage.read(r)
-		if err != nil {
-			return nil, err
+	for {
+		if !r.ready {
+			err := r.currentPage.read(r)
+			if err != nil {
+				return nil, err
+			}
+			r.packetIndex = 0
+			// On a continuation page the first packet completes a packet that
+			// started on an earlier page, so it is skipped. A page with zero
+			// segments has no packets at all and there is nothing to skip;
+			// advancing past the empty packets slice would panic.
+			if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 && r.currentPage.packetCount > 0 {
+				r.packetIndex = 1
+			}
+			r.ready = true
 		}
-		r.packetIndex = 0
-		if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 {
-			r.packetIndex = 1
+		if r.packetIndex != r.currentPage.packetCount {
+			packet := r.currentPage.packets[r.packetIndex]
+			r.packetIndex++
+			if r.packetIndex == r.currentPage.packetCount && r.currentPage.isLast() {
+				r.lastPacket = true
+			}
+			return packet, nil
 		}
-		r.ready = true
-	}
-	if r.packetIndex == r.currentPage.packetCount {
+		// The page has no more complete packets. Carry any partial packet
+		// over to the next page and continue there. Zero-segment pages (and
+		// pages made up entirely of 0xff continuation segments) have no
+		// packets, so this simply walks on to the next page.
 		rest := r.currentPage.packets[r.currentPage.packetCount]
 		if r.currentPage.AbsoluteGranulePosition != -1 {
 			r.lastPagePosition = r.currentPage.AbsoluteGranulePosition
@@ -44,14 +60,7 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 			r.currentPage.packets[0] = append(rest, r.currentPage.packets[0]...)
 		}
 		r.packetIndex = 0
-		return r.NextPacket()
 	}
-	packet := r.currentPage.packets[r.packetIndex]
-	r.packetIndex++
-	if r.packetIndex == r.currentPage.packetCount && r.currentPage.isLast() {
-		r.lastPacket = true
-	}
-	return packet, nil
 }
 
 func (r *oggReader) Restore() error {
@@ -91,7 +100,11 @@ func (r *oggReader) LastPosition() (int64, error) {
 		} else if err != nil {
 			return result, err
 		}
-		result = p.AbsoluteGranulePosition
+		// An empty page has no granule position of its own; keep the last
+		// meaningful one so it cannot overwrite the result (e.g. with -1).
+		if p.AbsoluteGranulePosition != -1 {
+			result = p.AbsoluteGranulePosition
+		}
 		if p.isLast() {
 			return result, nil
 		}
@@ -119,7 +132,11 @@ func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
 			if err != nil {
 				return 0, err
 			}
-			if lastPos > 0 {
+			// lastOffset is updated below only for pages that carry packets;
+			// an empty page has no packet to resume at, so leave the reader
+			// positioned before the following page instead of indexing into
+			// the empty page's packet slice.
+			if lastPos > 0 && r.currentPage.packetCount > 0 {
 				r.packetIndex = r.currentPage.packetCount - 1
 				r.ready = true
 			} else {
@@ -130,8 +147,12 @@ func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
 		if p.isLast() {
 			return 0, io.ErrUnexpectedEOF
 		}
-		lastOffset = offset
-		lastPos = p.AbsoluteGranulePosition
+		// Empty pages carry no packets and no granule position; use the most
+		// recent page that actually has a position as the seek anchor.
+		if p.packetCount > 0 && p.AbsoluteGranulePosition != -1 {
+			lastOffset = offset
+			lastPos = p.AbsoluteGranulePosition
+		}
 		r.seeker.Seek(int64(p.totalSize-len(r.buffer)), io.SeekCurrent)
 		r.buffer = nil
 	}
