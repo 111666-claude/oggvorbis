@@ -26,7 +26,11 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 			return nil, err
 		}
 		r.packetIndex = 0
-		if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 {
+		if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 && r.currentPage.packetCount > 0 {
+			// A continuation page's first packet finishes the packet that
+			// started on the previous page; skip it. A zero-segment page has
+			// no packets at all, so there is nothing to skip—indexing past
+			// the empty packets slice would panic.
 			r.packetIndex = 1
 		}
 		r.ready = true
