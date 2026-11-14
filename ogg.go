@@ -26,7 +26,7 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 			return nil, err
 		}
 		r.packetIndex = 0
-		if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 {
+		if r.currentPage.HeaderTypeFlag&headerFlagContinuedPacket != 0 && r.currentPage.packetCount > 0 {
 			r.packetIndex = 1
 		}
 		r.ready = true
@@ -223,7 +223,7 @@ func (p *page) readHeader(r io.Reader) error {
 			size = 0
 		}
 	}
-	p.needsContinue = segmentTable[p.PageSegments-1] == 0xFF
+	p.needsContinue = p.PageSegments > 0 && segmentTable[p.PageSegments-1] == 0xFF
 	return nil
 }
 
