@@ -46,7 +46,10 @@ func (r *Reader) init() error {
 	for i := 0; i < 3; i++ {
 		packet, err := r.r.NextPacket()
 		if err != nil {
-			return err
+			// Three Vorbis headers are mandatory. Reaching the end of the
+			// input before they are complete is truncation, not a clean end
+			// of stream.
+			return noEOF(err)
 		}
 		err = r.dec.ReadHeader(packet)
 		if err != nil {

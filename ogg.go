@@ -190,6 +190,11 @@ func (p *page) read(r io.Reader) error {
 
 func (p *page) readHeader(r io.Reader) error {
 	data := make([]byte, 27)
+	// A bare EOF here means the stream ended at a page boundary, which is a
+	// clean end of stream for callers that can accept one (LastPosition, a
+	// Read after the final page). A partial page header is already reported
+	// as io.ErrUnexpectedEOF by io.ReadFull. Callers that require a page
+	// (for example Reader.init) translate a clean EOF with noEOF.
 	_, err := io.ReadFull(r, data)
 	if err != nil {
 		return err
@@ -204,7 +209,9 @@ func (p *page) readHeader(r io.Reader) error {
 	segmentTable := make([]byte, p.PageSegments)
 	_, err = io.ReadFull(r, segmentTable)
 	if err != nil {
-		return err
+		// The page header announced segments, so the stream cannot end
+		// cleanly here; even a zero-byte read is a truncated page.
+		return noEOF(err)
 	}
 	data[22], data[23], data[24], data[25] = 0, 0, 0, 0
 	p.headerChecksum = crcUpdate(0, data)
@@ -223,7 +230,9 @@ func (p *page) readHeader(r io.Reader) error {
 			size = 0
 		}
 	}
-	p.needsContinue = segmentTable[p.PageSegments-1] == 0xFF
+	// A page may legitimately have zero segments. Guard against the uint8
+	// underflow of PageSegments-1, which would index an empty segment table.
+	p.needsContinue = len(segmentTable) > 0 && segmentTable[len(segmentTable)-1] == 0xFF
 	return nil
 }
 
@@ -231,7 +240,9 @@ func (p *page) readContent(r io.Reader) error {
 	content := make([]byte, p.totalSize)
 	_, err := io.ReadFull(r, content)
 	if err != nil {
-		return err
+		// The header announced content bytes, so ending before all of them
+		// were read is a truncated page, even when nothing was read at all.
+		return noEOF(err)
 	}
 	checksum := crcUpdate(p.headerChecksum, content)
 	if checksum != p.PageChecksum {
@@ -245,4 +256,15 @@ func (p *page) readContent(r io.Reader) error {
 	}
 	p.packets[p.packetCount] = content[offset:]
 	return nil
+}
+
+// noEOF converts a bare io.EOF into io.ErrUnexpectedEOF. It is used where the
+// format has already announced that more bytes are required, so reaching the
+// end of the input is a truncation rather than a clean end of stream. Errors
+// from the underlying reader are preserved unchanged.
+func noEOF(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }

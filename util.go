@@ -65,7 +65,9 @@ func GetFormat(in io.Reader) (*Format, error) {
 	r := oggReader{source: in}
 	p, err := r.NextPacket()
 	if err != nil {
-		return nil, err
+		// The identification header is mandatory, so a clean end of input
+		// before it is truncation, not a valid end of stream.
+		return nil, noEOF(err)
 	}
 	err = dec.ReadHeader(p)
 	if err != nil {
@@ -85,7 +87,8 @@ func GetCommentHeader(in io.Reader) (vorbis.CommentHeader, error) {
 	for i := 0; i < 2; i++ {
 		p, err := r.NextPacket()
 		if err != nil {
-			return vorbis.CommentHeader{}, err
+			// Both header packets are mandatory.
+			return vorbis.CommentHeader{}, noEOF(err)
 		}
 		err = dec.ReadHeader(p)
 		if err != nil {
@@ -101,7 +104,8 @@ func GetLength(in io.ReadSeeker) (int64, *Format, error) {
 	var dec vorbis.Decoder
 	p, err := r.NextPacket()
 	if err != nil {
-		return 0, nil, err
+		// The identification header is mandatory.
+		return 0, nil, noEOF(err)
 	}
 	err = dec.ReadHeader(p)
 	if err != nil {
