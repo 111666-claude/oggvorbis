@@ -54,22 +54,83 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 	return packet, nil
 }
 
+// restoreBufferSize is the maximum amount of input Restore reads at a time.
+const restoreBufferSize = 1024
+
+// Restore advances the reader until the next page capture pattern is found.
+//
+// On success the buffered data starts with the capture pattern, so the page
+// header, segment table and packet data that may have been read together
+// with the pattern are not lost.
+//
+// On failure at most len(capturePattern)-1 trailing bytes that could still
+// be the beginning of a capture pattern are kept, so a later call reports the
+// same result instead of re-reading input that was already consumed. Restore
+// always makes progress: it returns io.EOF for empty input, io.ErrUnexpectedEOF
+// when the input ends in the middle of a possible pattern, io.ErrNoProgress
+// for a source that neither returns data nor an error, and the underlying
+// error otherwise.
 func (r *oggReader) Restore() error {
-	buffer := make([]byte, 1024)
+	r.ready = false
+	r.lastPacket = false
+
+	buf := make([]byte, restoreBufferSize)
+	n := 0
+
+	// Examine any bytes left over from a previous call first. Anything
+	// before a pattern is garbage, and without a pattern only the final
+	// bytes can still be the prefix of one.
+	if len(r.buffer) > 0 {
+		if i := bytes.Index(r.buffer, capturePattern[:]); i >= 0 {
+			r.buffer = append([]byte(nil), r.buffer[i:]...)
+			return nil
+		}
+		keep := len(r.buffer)
+		if keep > len(capturePattern)-1 {
+			keep = len(capturePattern) - 1
+		}
+		n = copy(buf, r.buffer[len(r.buffer)-keep:])
+		r.buffer = nil
+	}
+
+	var readErr error
 	for {
-		b := buffer
-		n, err := io.ReadAtLeast(r, b, 4)
+		if i := bytes.Index(buf[:n], capturePattern[:]); i >= 0 {
+			// Keep everything from the pattern onwards.
+			r.buffer = append([]byte(nil), buf[i:n]...)
+			return nil
+		}
+
+		// Only a partial pattern at the end can matter for the next
+		// attempt; discarding the rest keeps the buffer bounded.
+		keep := n
+		if keep > len(capturePattern)-1 {
+			keep = len(capturePattern) - 1
+		}
+		copy(buf, buf[n-keep:n])
+		n = keep
+
+		if readErr != nil {
+			r.buffer = append([]byte(nil), buf[:n]...)
+			if readErr == io.EOF && n > 0 {
+				// The input ended in the middle of a possible
+				// capture pattern.
+				return io.ErrUnexpectedEOF
+			}
+			return readErr
+		}
+
+		m, err := r.Read(buf[n:])
+		n += m
 		if err != nil {
-			return err
+			readErr = err
 		}
-		i := bytes.Index(b[:n], capturePattern[:])
-		if i == -1 {
-			r.buffer = b[n-3:]
-			continue
+		if m == 0 && err == nil {
+			// A source that returns neither data nor an error
+			// would otherwise turn this loop into a busy wait.
+			r.buffer = append([]byte(nil), buf[:n]...)
+			return io.ErrNoProgress
 		}
-		r.buffer = b[i:n]
-		r.ready = false
-		return nil
 	}
 }
 
