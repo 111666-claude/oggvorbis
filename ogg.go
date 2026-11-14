@@ -54,22 +54,79 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 	return packet, nil
 }
 
+// restoreBufferSize is the maximum amount of input Restore reads at once.
+const restoreBufferSize = 1024
+
+// Restore advances the reader until the next page capture pattern is found.
+//
+// Only the last len(capturePattern)-1 bytes that did not match are kept
+// between reads, so a capture pattern split across two Read calls is still
+// recognized while the amount of buffered data stays bounded. Restore always
+// makes progress: it returns io.EOF for empty input, io.ErrUnexpectedEOF when
+// the input ends before a complete capture pattern is found, and the
+// underlying error otherwise.
 func (r *oggReader) Restore() error {
-	buffer := make([]byte, 1024)
+	buf := make([]byte, restoreBufferSize)
+	n := 0
+
+	r.ready = false
+	r.lastPacket = false
+
+	// First look at bytes that were already buffered. Everything but a
+	// possible partial capture pattern at the end can be discarded.
+	if len(r.buffer) > 0 {
+		if i := bytes.Index(r.buffer, capturePattern[:]); i >= 0 {
+			r.buffer = r.buffer[i:]
+			return nil
+		}
+		keep := len(r.buffer)
+		if keep > len(capturePattern)-1 {
+			keep = len(capturePattern) - 1
+		}
+		n = copy(buf, r.buffer[len(r.buffer)-keep:])
+		r.buffer = nil
+	}
+
+	var readErr error
 	for {
-		b := buffer
-		n, err := io.ReadAtLeast(r, b, 4)
+		if i := bytes.Index(buf[:n], capturePattern[:]); i >= 0 {
+			// Keep everything from the pattern onwards: the page header,
+			// segment table and (possibly) audio data that followed it in
+			// this read must not be lost.
+			r.buffer = append([]byte(nil), buf[i:n]...)
+			return nil
+		}
+
+		// Retain at most the bytes that can still be the start of a
+		// capture pattern in the next read.
+		keep := n
+		if keep > len(capturePattern)-1 {
+			keep = len(capturePattern) - 1
+		}
+		copy(buf, buf[n-keep:n])
+		n = keep
+
+		if readErr != nil {
+			// Preserve the remaining partial pattern so that calling Restore
+			// again reports the same result instead of silently losing it.
+			r.buffer = append([]byte(nil), buf[:n]...)
+			if readErr == io.EOF && n > 0 {
+				return io.ErrUnexpectedEOF
+			}
+			return readErr
+		}
+
+		m, err := r.Read(buf[n:])
+		n += m
 		if err != nil {
-			return err
+			readErr = err
 		}
-		i := bytes.Index(b[:n], capturePattern[:])
-		if i == -1 {
-			r.buffer = b[n-3:]
-			continue
+		if m == 0 && err == nil {
+			// A Reader that returns no data and no error would otherwise
+			// make the scan retry forever.
+			r.buffer = append([]byte(nil), buf[:n]...)
+			return io.ErrNoProgress
 		}
-		r.buffer = b[i:n]
-		r.ready = false
-		return nil
 	}
 }
 
