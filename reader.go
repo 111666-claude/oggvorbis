@@ -40,6 +40,13 @@ func (r *Reader) init() error {
 			r.length = length
 		}
 		r.r.seeker.Seek(0, io.SeekStart)
+		// The length probe may have left unread bytes in the buffer
+		// (Restore reads ahead in chunks); reset the read state so the
+		// header parse starts at the beginning of the stream, not in
+		// the middle of stale probe data.
+		r.r.buffer = nil
+		r.r.ready = false
+		r.r.lastPacket = false
 	}
 
 	// read headers

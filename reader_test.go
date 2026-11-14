@@ -189,6 +189,122 @@ func TestEmpty(t *testing.T) {
 	}
 }
 
+// TestSeekableVsNonSeekable decodes the same file through a seekable and
+// a non-seekable source and requires identical headers and sample output
+// (the seekable output may be shorter when the stream lacks an
+// EndOfStream flag, since the probed length truncates the tail).
+func TestSeekableVsNonSeekable(t *testing.T) {
+	for _, filename := range []string{"testdata/test.ogg", "testdata/long.ogg", "testdata/eof_issue.ogg"} {
+		t.Run(filename, func(t *testing.T) {
+			ogg, err := os.Open(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ogg.Close()
+			sr, err := oggvorbis.NewReader(ogg)
+			if err != nil {
+				t.Fatal("seekable NewReader: ", err)
+			}
+
+			ogg2, err := os.Open(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ogg2.Close()
+			nr, err := oggvorbis.NewReader(reader{ogg2})
+			if err != nil {
+				t.Fatal("non-seekable NewReader: ", err)
+			}
+
+			if sr.SampleRate() != nr.SampleRate() || sr.Channels() != nr.Channels() {
+				t.Errorf("format mismatch: seekable %d/%d, non-seekable %d/%d",
+					sr.SampleRate(), sr.Channels(), nr.SampleRate(), nr.Channels())
+			}
+			sc, nc := sr.CommentHeader(), nr.CommentHeader()
+			if sc.Vendor != nc.Vendor || len(sc.Comments) != len(nc.Comments) {
+				t.Errorf("comment header mismatch: %q %v vs %q %v",
+					sc.Vendor, sc.Comments, nc.Vendor, nc.Comments)
+			}
+
+			sSamples := readAll(t, sr)
+			nSamples := readAll(t, nr)
+			if len(sSamples) > len(nSamples) {
+				t.Fatalf("seekable decoded %d samples, non-seekable only %d",
+					len(sSamples), len(nSamples))
+			}
+			compareExact(t, sSamples, nSamples[:len(sSamples)])
+		})
+	}
+}
+
+// TestRepeatedReaders checks that decoding the same data twice gives
+// identical results and that reads after EOF keep returning EOF instead
+// of repeating packets.
+func TestRepeatedReaders(t *testing.T) {
+	data, err := os.ReadFile("testdata/test.ogg")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decode := func(t *testing.T) *oggvorbis.Reader {
+		r, err := oggvorbis.NewReader(bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+
+	r1 := decode(t)
+	first := readAll(t, r1)
+	r2 := decode(t)
+	second := readAll(t, r2)
+	compareExact(t, first, second)
+
+	if want := 44100 * r1.Channels(); len(first) != want {
+		t.Fatalf("decoded %d values, expected %d", len(first), want)
+	}
+
+	// reads after EOF must not produce more data
+	buf := make([]float32, 512)
+	for i := 0; i < 3; i++ {
+		n, err := r1.Read(buf)
+		if n != 0 || err != io.EOF {
+			t.Errorf("read %d after EOF: n=%d, err=%v, expected 0, EOF", i, n, err)
+		}
+	}
+}
+
+func compareExact(t *testing.T, a, e []float32) {
+	t.Helper()
+	if len(a) != len(e) {
+		t.Fatalf("length of output is %d, expected %d", len(a), len(e))
+	}
+	for i := range a {
+		if a[i] != e[i] {
+			t.Fatalf("different values at index %d (%g != %g)", i, a[i], e[i])
+		}
+	}
+}
+
+func readAll(t *testing.T, r *oggvorbis.Reader) []float32 {
+	t.Helper()
+	buf := make([]float32, 4096)
+	var out []float32
+	for {
+		n, err := r.Read(buf)
+		out = append(out, buf[:n]...)
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatal("read error: ", err)
+		}
+		if n == 0 {
+			t.Fatal("no progress")
+		}
+	}
+}
+
 func compare(t *testing.T, a, e []float32, tolerance float32) {
 	if len(a) != len(e) {
 		t.Fatalf("length of output is %d, expected %d", len(a), len(e))

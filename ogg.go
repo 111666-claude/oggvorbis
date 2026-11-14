@@ -223,7 +223,7 @@ func (p *page) readHeader(r io.Reader) error {
 			size = 0
 		}
 	}
-	p.needsContinue = segmentTable[p.PageSegments-1] == 0xFF
+	p.needsContinue = p.PageSegments > 0 && segmentTable[p.PageSegments-1] == 0xFF
 	return nil
 }
 
