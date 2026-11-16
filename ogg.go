@@ -7,6 +7,12 @@ import (
 	"io"
 )
 
+// errSegmentStart is returned by NextPacket when a new chained logical stream
+// begins (a BOS page with a new serial following the previous stream's EOS
+// page). The packets of the new stream's first page are returned by the
+// subsequent NextPacket calls.
+var errSegmentStart = errors.New("ogg: start of new chained stream")
+
 type oggReader struct {
 	source io.Reader
 	seeker io.Seeker
@@ -17,12 +23,18 @@ type oggReader struct {
 	packetIndex      int
 	ready            bool
 	lastPacket       bool
+
+	// chained-stream state
+	serial       uint32
+	hasSerial    bool
+	eos          bool // the current logical stream's EOS page has been read
+	segmentStart bool // the page just read starts a new chained stream
+	segmentEnd   bool // the packet last returned ends its logical stream
 }
 
 func (r *oggReader) NextPacket() ([]byte, error) {
 	if !r.ready {
-		err := r.currentPage.read(r)
-		if err != nil {
+		if err := r.readPage(); err != nil {
 			return nil, err
 		}
 		r.packetIndex = 0
@@ -30,15 +42,26 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 			r.packetIndex = 1
 		}
 		r.ready = true
+		if r.segmentStart {
+			r.segmentStart = false
+			return nil, errSegmentStart
+		}
 	}
 	if r.packetIndex == r.currentPage.packetCount {
 		rest := r.currentPage.packets[r.currentPage.packetCount]
 		if r.currentPage.AbsoluteGranulePosition != -1 {
 			r.lastPagePosition = r.currentPage.AbsoluteGranulePosition
 		}
-		err := r.currentPage.read(r)
-		if err != nil {
+		if err := r.readPage(); err != nil {
 			return nil, err
+		}
+		if r.segmentStart {
+			r.segmentStart = false
+			if len(rest) > 0 {
+				return nil, errors.New("ogg: packet continued across chained streams")
+			}
+			r.packetIndex = 0
+			return nil, errSegmentStart
 		}
 		if len(rest) > 0 {
 			r.currentPage.packets[0] = append(rest, r.currentPage.packets[0]...)
@@ -49,63 +72,135 @@ func (r *oggReader) NextPacket() ([]byte, error) {
 	packet := r.currentPage.packets[r.packetIndex]
 	r.packetIndex++
 	if r.packetIndex == r.currentPage.packetCount && r.currentPage.isLast() {
-		r.lastPacket = true
+		r.segmentEnd = true
 	}
 	return packet, nil
 }
 
-func (r *oggReader) Restore() error {
-	buffer := make([]byte, 1024)
-	for {
-		b := buffer
-		n, err := io.ReadAtLeast(r, b, 4)
-		if err != nil {
-			return err
+// readPage reads the next page and validates its serial number against the
+// current logical stream. A page with a different serial is only accepted as
+// the BOS page of a chained stream following an EOS page; anything else is
+// rejected as multiplexed or corrupt input.
+func (r *oggReader) readPage() error {
+	err := r.currentPage.read(r)
+	if err != nil {
+		if err == io.EOF {
+			r.lastPacket = true
 		}
-		i := bytes.Index(b[:n], capturePattern[:])
-		if i == -1 {
-			r.buffer = b[n-3 : n]
-			continue
-		}
-		r.buffer = b[i:n]
-		r.ready = false
-		return nil
+		return err
 	}
+	h := &r.currentPage.pageHeader
+	switch {
+	case !r.hasSerial:
+		r.serial = h.StreamSerialNumber
+		r.hasSerial = true
+	case h.StreamSerialNumber != r.serial:
+		if !r.eos || !h.isFirst() {
+			return errors.New("ogg: unexpected stream serial number (multiplexed streams are not supported)")
+		}
+		r.serial = h.StreamSerialNumber
+		r.eos = false
+		r.segmentStart = true
+	case r.eos:
+		return errors.New("ogg: unexpected page after end of stream")
+	}
+	if h.isLast() {
+		r.eos = true
+	}
+	return nil
 }
 
-func (r *oggReader) LastPosition() (int64, error) {
-	_, err := r.seeker.Seek(-maxPageSize, io.SeekEnd)
-	if err != nil {
-		r.seeker.Seek(0, io.SeekStart)
+// reset clears all paging and chaining state; the next page read is treated
+// as the start of a new file. The caller must have positioned the seeker.
+func (r *oggReader) reset() {
+	r.buffer = nil
+	r.ready = false
+	r.lastPacket = false
+	r.hasSerial = false
+	r.eos = false
+	r.segmentStart = false
+	r.segmentEnd = false
+}
+
+// A segment describes one logical stream of a chained ogg file.
+type segment struct {
+	offset int64 // byte offset of the segment's first page
+	base   int64 // cumulative position of the segment start, in samples
+	length int64 // length of the segment in samples
+}
+
+// scanChain scans the whole file, validates the chaining structure and
+// returns all logical streams with their cumulative sample offsets.
+// The seeker is left at the end of the file.
+func (r *oggReader) scanChain() ([]segment, error) {
+	if _, err := r.seeker.Seek(0, io.SeekStart); err != nil {
+		return nil, err
 	}
 	r.buffer = nil
-	if err := r.Restore(); err != nil {
-		return 0, err
-	}
-	var p page
-	var result int64
+	var segments []segment
+	var total, lastGranule int64
+	var serial uint32
+	var hasSerial, eos bool
 	for {
+		offset, _ := r.seeker.Seek(0, io.SeekCurrent)
+		var p page
 		err := p.readHeader(r)
 		if err == io.EOF {
-			return result, nil
-		} else if err != nil {
-			return result, err
+			break
 		}
-		result = p.AbsoluteGranulePosition
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !hasSerial:
+			serial = p.StreamSerialNumber
+			hasSerial = true
+			segments = append(segments, segment{offset: offset})
+		case p.StreamSerialNumber != serial:
+			if !eos || !p.isFirst() {
+				return nil, errors.New("ogg: unexpected stream serial number (multiplexed streams are not supported)")
+			}
+			serial = p.StreamSerialNumber
+			eos = false
+			segments = append(segments, segment{offset: offset, base: total})
+		case eos:
+			return nil, errors.New("ogg: unexpected page after end of stream")
+		}
+		if p.AbsoluteGranulePosition != -1 {
+			lastGranule = p.AbsoluteGranulePosition
+		}
 		if p.isLast() {
-			return result, nil
+			eos = true
+			total += p.AbsoluteGranulePosition
+			segments[len(segments)-1].length = p.AbsoluteGranulePosition
 		}
-		r.seeker.Seek(int64(p.totalSize-len(r.buffer)), io.SeekCurrent)
+		if _, err := r.seeker.Seek(int64(p.totalSize-len(r.buffer)), io.SeekCurrent); err != nil {
+			return nil, err
+		}
 		r.buffer = nil
 	}
+	if len(segments) == 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	if !eos {
+		// The last logical stream has no EOS page (truncated file); use the
+		// last seen granule position as its length.
+		segments[len(segments)-1].length = lastGranule
+	}
+	return segments, nil
 }
 
+// SeekPageBefore seeks to the last page with an AbsoluteGranulePosition <=
+// pos and returns that position. The seeker must be positioned at the start
+// of a page within the logical stream to search (after its header pages);
+// the scan stops at the stream's EOS page. Positions are relative to the
+// start of the logical stream.
 func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
-	r.seeker.Seek(0, io.SeekStart)
 	r.buffer = nil
 	r.lastPacket = false
+	startOffset, _ := r.seeker.Seek(0, io.SeekCurrent)
 	var p page
-	var lastOffset int64
+	lastOffset := int64(-1)
 	var lastPos int64
 	for {
 		offset, _ := r.seeker.Seek(0, io.SeekCurrent)
@@ -114,6 +209,13 @@ func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
 			return 0, err
 		}
 		if p.AbsoluteGranulePosition > pos {
+			if lastOffset < 0 {
+				// pos lies before the first page's granule position;
+				// start decoding from the beginning of the stream.
+				r.seeker.Seek(startOffset, io.SeekStart)
+				r.ready = false
+				return 0, nil
+			}
 			r.seeker.Seek(lastOffset, io.SeekStart)
 			err := r.currentPage.read(r)
 			if err != nil {

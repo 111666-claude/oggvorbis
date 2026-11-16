@@ -112,6 +112,10 @@ func GetLength(in io.ReadSeeker) (int64, *Format, error) {
 		Channels:   dec.Channels(),
 		Bitrate:    dec.Bitrate,
 	}
-	length, err := r.LastPosition()
-	return length, format, err
+	segments, err := r.scanChain()
+	if err != nil {
+		return 0, nil, err
+	}
+	last := segments[len(segments)-1]
+	return last.base + last.length, format, nil
 }
