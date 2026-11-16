@@ -18,13 +18,19 @@ type Reader struct {
 	toSkip         int
 
 	length int64
+
+	// ReplayGain processing; disabled by default (gain 1, limit 1 keeps
+	// the historical behavior of clipping to [-1, 1]).
+	gain       float32
+	peakLimit  float32
+	replayGain bool
 }
 
 // NewReader creates a new Reader.
 // Some of the returned reader's methods will only work if in also implements
 // io.Seeker
 func NewReader(in io.Reader) (*Reader, error) {
-	r := new(Reader)
+	r := &Reader{gain: 1, peakLimit: 1}
 	r.r.source = in
 	r.r.seeker, _ = in.(io.Seeker)
 	if err := r.init(); err != nil {
@@ -170,14 +176,27 @@ func (r *Reader) Read(p []float32) (int, error) {
 		p = p[n:]
 	}
 end:
-	for i := range out[:total] {
-		if out[i] > 1 {
-			out[i] = 1
-		} else if out[i] < -1 {
-			out[i] = -1
-		}
-	}
+	r.applyGain(out[:total])
 	return total, err
+}
+
+// applyGain scales p by the configured gain and clamps the result to
+// +/- the peak limit. With the default configuration (gain 1, limit 1)
+// this is exactly the historical clip to [-1, 1]. When ReplayGain
+// processing is enabled NaN samples are additionally mapped to 0.
+func (r *Reader) applyGain(p []float32) {
+	gain, limit := r.gain, r.peakLimit
+	for i, v := range p {
+		v *= gain
+		if v > limit {
+			v = limit
+		} else if v < -limit {
+			v = -limit
+		} else if r.replayGain && v != v {
+			v = 0
+		}
+		p[i] = v
+	}
 }
 
 func (r *Reader) fillBuffer() error {
