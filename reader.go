@@ -18,6 +18,20 @@ type Reader struct {
 	toSkip         int
 
 	length int64
+
+	// loop state; zero value means looping is disabled and the reader
+	// behaves exactly like a plain, non-looping decoder.
+	looping   bool
+	loopStart int64
+	loopEnd   int64
+	// loopCount is the number of full loop regions still to be played after
+	// the current one. -1 means loop forever.
+	loopCount int64
+	// loopAtEnd marks that a decoded packet reached loopEnd. The buffered
+	// samples up to the boundary are delivered first, then a jump to
+	// loopSeekPos is performed.
+	loopAtEnd   bool
+	loopSeekPos int64
 }
 
 // NewReader creates a new Reader.
@@ -97,26 +111,27 @@ func (r *Reader) Length() int64 { return r.length }
 
 // SetPosition seeks to a position in samples.
 // It will return an error if the underlying reader is not seekable.
+//
+// When looping is enabled, pos must lie within the loop region
+// ([loopStart, loopEnd)); otherwise ErrLoopPositionOutOfRange is returned and
+// the reader is not moved.
 func (r *Reader) SetPosition(pos int64) error {
 	if r.r.seeker == nil {
 		return errors.New("oggvorbis: reader is not seekable")
 	}
+	if r.looping && (pos < r.loopStart || pos >= r.loopEnd) {
+		return ErrLoopPositionOutOfRange
+	}
 	r.buffer = nil
+	r.loopAtEnd = false
+	r.loopSeekPos = 0
+	r.toSkip = 0
 	if pos >= r.length {
 		r.r.lastPacket = true
 		r.position = r.length
 		return nil
 	}
-	start, err := r.r.SeekPageBefore(pos)
-	if err != nil {
-		return err
-	}
-	packet, err := r.r.NextPacket()
-	r.dec.Clear()
-	r.dec.DecodeInto(packet, r.originalBuffer)
-	r.position = start
-	r.toSkip = int(pos-start) * r.Channels()
-	return nil
+	return r.seekTo(pos)
 }
 
 // Read reads and decodes audio data and stores the result in p.
@@ -134,6 +149,9 @@ func (r *Reader) Read(p []float32) (int, error) {
 	}
 	if len(p)%r.Channels() != 0 {
 		p = p[:len(p)/r.Channels()*r.Channels()]
+	}
+	if r.looping || r.loopAtEnd {
+		return r.readLooped(p)
 	}
 	out := p
 	total := 0
