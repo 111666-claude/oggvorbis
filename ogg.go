@@ -17,6 +17,9 @@ type oggReader struct {
 	packetIndex      int
 	ready            bool
 	lastPacket       bool
+
+	index     *seekIndex // nil: no index, SeekPageBefore scans from the start
+	seekScans int        // pages inspected by the most recent SeekPageBefore
 }
 
 func (r *oggReader) NextPacket() ([]byte, error) {
@@ -100,20 +103,68 @@ func (r *oggReader) LastPosition() (int64, error) {
 	}
 }
 
+// SeekPageBefore positions the reader at the last page whose granule position
+// is <= pos and returns that page's granule position. When a seek index is
+// available the forward scan starts at the nearest indexed anchor instead of
+// at the beginning of the stream.
 func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
-	r.seeker.Seek(0, io.SeekStart)
+	from, fromGranule := int64(0), int64(0)
+	if r.index != nil {
+		if offset, granule, ok := r.index.lookup(pos); ok {
+			if r.validPageOffset(offset) {
+				from, fromGranule = offset, granule
+			} else {
+				// The indexed offset no longer holds a page capture
+				// pattern: the stream changed since the index was built.
+				// Drop the index and degrade to a full scan.
+				r.index = nil
+			}
+		}
+	}
+	return r.seekPageBefore(pos, from, fromGranule)
+}
+
+// validPageOffset reports whether a page capture pattern is present at the
+// given file offset. It is used to detect streams that changed after the
+// seek index was built.
+func (r *oggReader) validPageOffset(offset int64) bool {
+	if offset == 0 {
+		return true
+	}
+	if _, err := r.seeker.Seek(offset, io.SeekStart); err != nil {
+		return false
+	}
+	var magic [4]byte
+	if _, err := io.ReadFull(r.source, magic[:]); err != nil {
+		return false
+	}
+	return magic == capturePattern
+}
+
+func (r *oggReader) seekPageBefore(pos, from, fromGranule int64) (int64, error) {
+	r.seeker.Seek(from, io.SeekStart)
 	r.buffer = nil
 	r.lastPacket = false
+	r.seekScans = 0
 	var p page
-	var lastOffset int64
-	var lastPos int64
+	lastOffset := from
+	lastPos := fromGranule
+	prevGranule := fromGranule
 	for {
 		offset, _ := r.seeker.Seek(0, io.SeekCurrent)
 		err := p.readHeader(r)
 		if err != nil {
 			return 0, err
 		}
-		if p.AbsoluteGranulePosition > pos {
+		r.seekScans++
+		g := p.AbsoluteGranulePosition
+		if g >= 0 {
+			if g < prevGranule {
+				return 0, errBadGranule
+			}
+			prevGranule = g
+		}
+		if g > pos {
 			r.seeker.Seek(lastOffset, io.SeekStart)
 			err := r.currentPage.read(r)
 			if err != nil {
@@ -130,8 +181,14 @@ func (r *oggReader) SeekPageBefore(pos int64) (int64, error) {
 		if p.isLast() {
 			return 0, io.ErrUnexpectedEOF
 		}
-		lastOffset = offset
-		lastPos = p.AbsoluteGranulePosition
+		// Pages with granule -1 contain no completed packet (a packet
+		// spans the whole page); they cannot serve as a seek target.
+		// Skipping them lets decoding resume at the previous page and
+		// reassemble the continued packet instead of dropping it.
+		if g >= 0 {
+			lastOffset = offset
+			lastPos = g
+		}
 		r.seeker.Seek(int64(p.totalSize-len(r.buffer)), io.SeekCurrent)
 		r.buffer = nil
 	}

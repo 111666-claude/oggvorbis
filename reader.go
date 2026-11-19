@@ -17,16 +17,35 @@ type Reader struct {
 	originalBuffer []float32
 	toSkip         int
 
-	length int64
+	length            int64
+	seekIndexInterval int64
 }
 
 // NewReader creates a new Reader.
 // Some of the returned reader's methods will only work if in also implements
-// io.Seeker
+// io.Seeker.
+//
+// For seekable inputs a sparse seek index is built with the default interval
+// (DefaultSeekIndexInterval samples), so that repeated SetPosition calls do
+// not each rescan the stream from the beginning.
 func NewReader(in io.Reader) (*Reader, error) {
+	return NewReaderWithSeekIndex(in, DefaultSeekIndexInterval)
+}
+
+// NewReaderWithSeekIndex creates a new Reader that, if in also implements
+// io.Seeker, builds a sparse page index with one entry per interval samples
+// (per channel) to accelerate SetPosition. An interval <= 0 disables the
+// index and restores the old behavior of scanning from the start of the
+// stream on every seek.
+//
+// Building the index is best-effort: if the stream cannot be indexed (for
+// example chained streams or invalid granule positions) the reader still
+// works, SetPosition just falls back to the linear scan.
+func NewReaderWithSeekIndex(in io.Reader, interval int64) (*Reader, error) {
 	r := new(Reader)
 	r.r.source = in
 	r.r.seeker, _ = in.(io.Seeker)
+	r.seekIndexInterval = interval
 	if err := r.init(); err != nil {
 		return nil, err
 	}
@@ -38,6 +57,13 @@ func (r *Reader) init() error {
 		length, err := r.r.LastPosition()
 		if err == nil {
 			r.length = length
+		}
+		if r.seekIndexInterval > 0 {
+			// Best-effort: any build failure simply leaves the index
+			// nil and seeks fall back to a linear page scan.
+			if idx, err := buildSeekIndex(r.r.source, r.r.seeker, r.seekIndexInterval); err == nil {
+				r.r.index = idx
+			}
 		}
 		r.r.buffer = nil
 		r.r.seeker.Seek(0, io.SeekStart)
@@ -96,10 +122,15 @@ func (r *Reader) Position() int64 {
 func (r *Reader) Length() int64 { return r.length }
 
 // SetPosition seeks to a position in samples.
-// It will return an error if the underlying reader is not seekable.
+// It will return an error if the underlying reader is not seekable or if pos
+// is negative. Seeking to or past the end of the stream is allowed; the
+// following Read will return io.EOF.
 func (r *Reader) SetPosition(pos int64) error {
 	if r.r.seeker == nil {
 		return errors.New("oggvorbis: reader is not seekable")
+	}
+	if pos < 0 {
+		return errors.New("oggvorbis: negative position")
 	}
 	r.buffer = nil
 	if pos >= r.length {
